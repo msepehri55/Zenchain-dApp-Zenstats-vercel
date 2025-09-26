@@ -2,6 +2,7 @@
 import Head from 'next/head';
 import { useEffect, useMemo, useRef, useState } from 'react';
 
+// Final categories for prizes (ci removed; cco merged into cc)
 const CATEGORIES = [
   'stake',
   'native_send',
@@ -9,9 +10,6 @@ const CATEGORIES = [
   'domain_mint',
   'gm',
   'cc',
-  'cco',
-  'ci',
-  // 'fail', 'other' // usually not used for awards
 ];
 
 // Helper: convert any Google Sheets link to CSV export form
@@ -28,12 +26,12 @@ function toCsvUrl(input) {
   return input;
 }
 
-// Very simple CSV parser (expects "discord, wallet" or headers containing "discord"/"wallet|address")
+// Simple CSV parser (expects columns for discord + wallet/address; header optional)
 function parseCsv(text) {
   const lines = String(text || '').replace(/\r/g, '').split('\n').map(l => l.trim()).filter(Boolean);
   if (!lines.length) return [];
   const header = lines[0].split(',').map(s => s.trim().toLowerCase());
-  let hasHeader = header.some(h => /discord|username|wallet|address/.test(h));
+  const hasHeader = header.some(h => /discord|username|wallet|address/.test(h));
   let idxDiscord = hasHeader ? header.findIndex(h => /discord|username/.test(h)) : 0;
   let idxWallet  = hasHeader ? header.findIndex(h => /wallet|address/.test(h))  : 1;
   if (idxDiscord === -1) idxDiscord = 0;
@@ -51,7 +49,7 @@ function parseCsv(text) {
   return out;
 }
 
-// Concurrency limiter
+// Concurrency limiter for wallet fetches
 function pLimit(concurrency) {
   let active = 0;
   const q = [];
@@ -70,27 +68,34 @@ function pLimit(concurrency) {
     });
 }
 
-export default function Admin() {
-  // Auth is handled by middleware (basic auth). Nothing needed here.
+// Map site categories so that 'cco' folds into 'cc', and ignore 'ci'
+function canonicalizeCategory(c) {
+  if (c === 'cco') return 'cc';
+  if (c === 'ci') return null; // ignore
+  return c;
+}
 
+export default function Admin() {
+  // Data input
   const [sheetUrl, setSheetUrl] = useState('');
   const [csvText, setCsvText] = useState('');
   const [loadingSheet, setLoadingSheet] = useState(false);
 
+  // Window
   const [period, setPeriod] = useState('7d'); // 24h, 7d, 30d, all, custom
   const [start, setStart] = useState('');
   const [end, setEnd] = useState('');
   const showingCustom = period === 'custom';
   const parseLocalDT = (s) => Math.floor(new Date(s).getTime() / 1000);
 
-  // thresholds + options
+  // Thresholds and options
   const [thresholds, setThresholds] = useState(() => {
     const t = {};
-    CATEGORIES.forEach(c => t[c] = 0);
+    CATEGORIES.forEach(c => (t[c] = 0));
     return t;
   });
   const [minTotal, setMinTotal] = useState(0);
-  const [mode, setMode] = useState('all'); // 'all' or 'any'
+  const [leniency, setLeniency] = useState(0); // NEW: ignore up to N tx across all parts
   const [groupByDiscord, setGroupByDiscord] = useState(true);
   const [showOnlyWinners, setShowOnlyWinners] = useState(true);
   const [concurrency, setConcurrency] = useState(3);
@@ -98,8 +103,9 @@ export default function Admin() {
   // Results
   const [status, setStatus] = useState('');
   const [progress, setProgress] = useState({ done: 0, total: 0 });
-  const [results, setResults] = useState([]); // raw per-wallet rows
-  const [winners, setWinners] = useState([]); // final filtered
+  const [results, setResults] = useState([]); // aggregated per discord (if grouping) or per wallet
+  const [winnersByGroup, setWinnersByGroup] = useState({ 0: [], 1: [], 2: [], 3: [] });
+  const [winTab, setWinTab] = useState(0); // 0,1,2,3 tabs
   const abortRef = useRef({ aborted: false });
 
   useEffect(() => {
@@ -135,49 +141,61 @@ export default function Admin() {
     }
   }
 
+  // Count per-category using your existing activity categories; merge cco->cc; ignore ci
   function computeCounts(activity) {
-    // Use only native (external) txs for category counts and total
     const ext = activity.filter(r => r.kind === 'native');
     const counts = {};
-    CATEGORIES.forEach(c => counts[c] = 0);
+    CATEGORIES.forEach(c => (counts[c] = 0));
     for (const r of ext) {
-      const cat = r.category || 'other';
-      if (counts[cat] == null) counts[cat] = 0;
-      counts[cat] += 1;
+      const c0 = canonicalizeCategory(r.category);
+      if (!c0) continue;
+      if (counts[c0] == null) counts[c0] = 0;
+      counts[c0] += 1;
     }
     const total = ext.length;
-    const lastMs = activity.length ? Math.max(...activity.map(r => r.timeMs)) : 0;
-    return { counts, total, lastMs };
+    return { counts, total };
   }
 
-  function meetsThreshold(counts, total) {
-    if (minTotal > 0 && total < minTotal) return false;
-    const active = Object.entries(thresholds).filter(([k, v]) => Number(v) > 0);
-    if (!active.length) return minTotal > 0 ? total >= minTotal : true;
+  // Apply leniency across deficits to maximize completed parts
+  // Returns number of missed parts AFTER spending leniency, and leniencyUsed
+  function evaluateWithLeniency(counts, thresholds, leniencyN) {
+    const reqCats = Object.keys(thresholds).filter(c => thresholds[c] > 0);
+    const deficits = reqCats
+      .map(c => ({ cat: c, need: Math.max(0, thresholds[c] - (counts[c] || 0)) }))
+      .filter(d => d.need > 0)
+      .sort((a, b) => a.need - b.need);
 
-    if (mode === 'all') {
-      return active.every(([k, v]) => (counts[k] || 0) >= Number(v));
-    } else {
-      return active.some(([k, v]) => (counts[k] || 0) >= Number(v));
+    let remaining = Math.max(0, Number(leniencyN || 0));
+    for (const d of deficits) {
+      if (remaining <= 0) break;
+      if (d.need <= remaining) {
+        remaining -= d.need;
+        d.need = 0;
+      } else {
+        d.need -= remaining;
+        remaining = 0;
+      }
     }
+    const missedAfter = deficits.filter(d => d.need > 0).length;
+    const leniencyUsed = Math.max(0, Number(leniencyN || 0) - remaining);
+    return { missedAfter, leniencyUsed };
   }
 
   async function run() {
     try {
       if (!windowParams) { alert('Pick a valid date range'); return; }
-
       const list = parseCsv(csvText);
       if (!list.length) { alert('No valid (discord, wallet) rows found in CSV'); return; }
 
       setStatus('Querying wallets...');
       setProgress({ done: 0, total: list.length });
       setResults([]);
-      setWinners([]);
+      setWinnersByGroup({ 0: [], 1: [], 2: [], 3: [] });
       abortRef.current.aborted = false;
 
       const limit = pLimit(Math.max(1, Number(concurrency) || 3));
 
-      const tasks = list.map(({ discord, wallet }, idx) =>
+      const tasks = list.map(({ discord, wallet }) =>
         limit(async () => {
           if (abortRef.current.aborted) return null;
           const qs = `start=${windowParams.start}&end=${windowParams.end}`;
@@ -185,8 +203,8 @@ export default function Admin() {
           const r = await fetch(url);
           const j = await r.json();
           if (!r.ok) throw new Error(j?.error || 'activity failed');
-          const { counts, total, lastMs } = computeCounts(j.activity || []);
-          return { discord, wallet, counts, total, lastMs };
+          const { counts, total } = computeCounts(j.activity || []);
+          return { discord, wallet, counts, total };
         }).then((res) => {
           setProgress(p => ({ done: p.done + 1, total: p.total }));
           return res;
@@ -201,10 +219,9 @@ export default function Admin() {
         const map = new Map();
         for (const r of rows) {
           const key = r.discord;
-          const cur = map.get(key) || { discord: key, wallets: [], counts: {}, total: 0, lastMs: 0 };
+          const cur = map.get(key) || { discord: key, wallets: [], counts: {}, total: 0 };
           cur.wallets.push(r.wallet);
           cur.total += r.total;
-          cur.lastMs = Math.max(cur.lastMs, r.lastMs);
           for (const c of Object.keys(r.counts)) {
             cur.counts[c] = (cur.counts[c] || 0) + (r.counts[c] || 0);
           }
@@ -214,16 +231,33 @@ export default function Admin() {
           discord: x.discord,
           wallet: x.wallets.join(' | '),
           counts: x.counts,
-          total: x.total,
-          lastMs: x.lastMs
+          total: x.total
         }));
       }
 
-      // Filter winners
-      const winnersOnly = grouped.filter(r => meetsThreshold(r.counts, r.total));
-      setResults(grouped);
-      setWinners(winnersOnly);
-      setStatus(`Done. Wallets processed: ${list.length}. Winners: ${winnersOnly.length}.`);
+      // Evaluate with leniency and bucket winners into 0/1/2/3 missed parts
+      const reqCats = CATEGORIES.filter(c => thresholds[c] > 0);
+      const groups = { 0: [], 1: [], 2: [], 3: [] };
+
+      const annotated = grouped.map(r => {
+        const totalOk = Number(minTotal || 0) <= 0 ? true : (r.total >= Number(minTotal));
+        const { missedAfter, leniencyUsed } = evaluateWithLeniency(r.counts, thresholds, leniency);
+        const isWinner = totalOk && missedAfter <= 3; // Winners pages: 0..3 missed parts after leniency
+        const out = { ...r, leniencyUsed, missedParts: missedAfter, totalOk, isWinner };
+        if (isWinner) {
+          if (missedAfter === 0) groups[0].push(out);
+          else if (missedAfter === 1) groups[1].push(out);
+          else if (missedAfter === 2) groups[2].push(out);
+          else if (missedAfter === 3) groups[3].push(out);
+        }
+        return out;
+      });
+
+      setResults(annotated);
+      setWinnersByGroup(groups);
+
+      const totals = Object.values(groups).reduce((s, arr) => s + arr.length, 0);
+      setStatus(`Done. Processed ${grouped.length} ${groupByDiscord ? 'participants' : 'wallets'}. Winners: ${totals} (0-miss: ${groups[0].length}, 1-miss: ${groups[1].length}, 2-miss: ${groups[2].length}, 3-miss: ${groups[3].length}).`);
     } catch (e) {
       console.error(e);
       alert(e.message || String(e));
@@ -231,28 +265,31 @@ export default function Admin() {
     }
   }
 
-  function downloadCsv() {
-    const rows = showOnlyWinners ? winners : results;
+  function downloadCsv(rows) {
     if (!rows.length) return;
-    const header = ['discord', 'wallets', 'total', ...CATEGORIES];
+    const header = ['discord', 'wallets', 'total', ...CATEGORIES, 'leniency_used', 'missed_parts'];
     const lines = [header.join(',')];
     for (const r of rows) {
       const arr = [
-        `"${r.discord.replace(/"/g, '""')}"`,
+        `"${String(r.discord || '').replace(/"/g, '""')}"`,
         `"${String(r.wallet || '').replace(/"/g, '""')}"`,
         r.total
       ];
       for (const c of CATEGORIES) arr.push(r.counts?.[c] || 0);
+      arr.push(r.leniencyUsed || 0);
+      arr.push(r.missedParts ?? '');
       lines.push(arr.join(','));
     }
     const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `zenstats-winners-${Date.now()}.csv`;
+    a.download = `zenstats-${showOnlyWinners ? 'winners' : 'results'}-${Date.now()}.csv`;
     a.click();
   }
 
-  const rowsToShow = showOnlyWinners ? winners : results;
+  // Which rows to show
+  const currentWinnerRows = winnersByGroup[winTab] || [];
+  const rowsToShow = showOnlyWinners ? currentWinnerRows : results;
 
   return (
     <div className="min-h-screen text-slate-100">
@@ -269,13 +306,13 @@ export default function Admin() {
       </header>
 
       <main className="max-w-6xl mx-auto p-4">
-        {/* Data source */}
+        {/* Participants source */}
         <section className="glass rounded-xl p-4 border border-slate-800">
           <h2 className="text-lg font-semibold mb-3">Participants</h2>
           <div className="grid gap-3">
             <div className="flex flex-col md:flex-row gap-3 items-stretch md:items-end">
               <div className="flex-1">
-                <label className="text-sm text-slate-300">Google Sheet link (we auto-convert to CSV)</label>
+                <label className="text-sm text-slate-300">Google Sheet link (auto-converts to CSV)</label>
                 <div className="flex gap-2">
                   <input
                     value={sheetUrl}
@@ -291,9 +328,7 @@ export default function Admin() {
                     {loadingSheet ? 'Loading…' : 'Fetch CSV'}
                   </button>
                 </div>
-                <p className="mt-2 text-xs text-slate-400">
-                  Make sure the sheet is shared to “Anyone with the link”, or Publish to web.
-                </p>
+                <p className="mt-2 text-xs text-slate-400">Ensure the sheet is shared to “Anyone with the link” or publish to the web.</p>
               </div>
             </div>
 
@@ -342,18 +377,6 @@ export default function Admin() {
                 </div>
               )}
 
-              <div className="min-w-[160px]">
-                <label className="text-sm text-slate-300">Mode</label>
-                <select
-                  value={mode}
-                  onChange={e=>setMode(e.target.value)}
-                  className="mt-1 w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 min-h-[44px]"
-                >
-                  <option value="all">Must meet ALL thresholds</option>
-                  <option value="any">Meet ANY threshold</option>
-                </select>
-              </div>
-
               <div className="min-w-[180px]">
                 <label className="text-sm text-slate-300">Min total external tx</label>
                 <input
@@ -366,6 +389,18 @@ export default function Admin() {
               </div>
 
               <div className="min-w-[180px]">
+                <label className="text-sm text-slate-300">Leniency (ignore up to N tx)</label>
+                <input
+                  type="number"
+                  min="0"
+                  value={leniency}
+                  onChange={e=>setLeniency(Number(e.target.value))}
+                  className="mt-1 w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 min-h-[44px]"
+                  title="We will cover up to N shortfalls across all parts to count a participant as complete"
+                />
+              </div>
+
+              <div className="min-w-[180px]">
                 <label className="text-sm text-slate-300">Concurrency</label>
                 <input
                   type="number"
@@ -373,12 +408,12 @@ export default function Admin() {
                   value={concurrency}
                   onChange={e=>setConcurrency(Number(e.target.value))}
                   className="mt-1 w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 min-h-[44px]"
-                  title="How many wallets to check at once (use 2-4 to be gentle)"
+                  title="How many wallets to check in parallel (2–4 recommended)"
                 />
               </div>
             </div>
 
-            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-8 gap-2">
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2">
               {CATEGORIES.map(cat => (
                 <div key={cat}>
                   <label className="text-xs text-slate-300">Min {cat.replace('_',' ')}</label>
@@ -416,12 +451,37 @@ export default function Admin() {
           </div>
         </section>
 
-        {/* Results */}
+        {/* Winners/results */}
         <section className="mt-6 glass rounded-xl p-4 border border-slate-800">
           <div className="flex items-center justify-between gap-3">
-            <h2 className="text-lg font-semibold">Results {showOnlyWinners ? '(Winners)' : '(All)'}</h2>
+            <h2 className="text-lg font-semibold">
+              {showOnlyWinners ? 'Winners' : 'All Participants'}
+            </h2>
+
+            {/* Winner tabs (0/1/2/3 missed parts) */}
+            {showOnlyWinners && (
+              <div className="flex items-center gap-2 flex-wrap">
+                {[
+                  { k: 0, label: 'Completed all' },
+                  { k: 1, label: 'Missed 1 part' },
+                  { k: 2, label: 'Missed 2 parts' },
+                  { k: 3, label: 'Missed 3 parts' },
+                ].map(tab => (
+                  <button
+                    key={tab.k}
+                    onClick={() => setWinTab(tab.k)}
+                    className={`px-3 py-2 rounded min-h-[40px] ${
+                      winTab === tab.k ? 'bg-emerald-600/30 border border-emerald-400/40' : 'bg-slate-800 hover:bg-slate-700'
+                    }`}
+                  >
+                    {tab.label} ({(winnersByGroup[tab.k] || []).length})
+                  </button>
+                ))}
+              </div>
+            )}
+
             <button
-              onClick={downloadCsv}
+              onClick={() => downloadCsv(rowsToShow)}
               disabled={!rowsToShow.length}
               className="px-3 py-2 rounded bg-slate-800 hover:bg-slate-700 min-h-[40px]"
             >
@@ -442,7 +502,8 @@ export default function Admin() {
                     {CATEGORIES.map(c => (
                       <th key={c} className="px-3 py-2 text-left">{c.replace('_',' ')}</th>
                     ))}
-                    <th className="px-3 py-2 text-left">Last Activity</th>
+                    <th className="px-3 py-2 text-left">Leniency used</th>
+                    <th className="px-3 py-2 text-left">Missed parts</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -454,7 +515,8 @@ export default function Admin() {
                       {CATEGORIES.map(c => (
                         <td key={c} className="px-3 py-2">{r.counts?.[c] || 0}</td>
                       ))}
-                      <td className="px-3 py-2">{r.lastMs ? new Date(r.lastMs).toLocaleString() : ''}</td>
+                      <td className={`px-3 py-2 ${r.leniencyUsed > 0 ? 'text-emerald-300' : ''}`}>{r.leniencyUsed || 0}</td>
+                      <td className="px-3 py-2">{r.missedParts ?? ''}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -464,7 +526,7 @@ export default function Admin() {
         </section>
 
         <footer className="text-slate-400 text-sm mt-8 pb-safe">
-          Uses the same categorization as the main site (external tx only for totals and per‑category counts).
+          Notes: cc includes both direct deploys and CCO (merged). ci is excluded. Leniency covers total shortfalls across all thresholded categories; min total is not lenient.
         </footer>
       </main>
     </div>
