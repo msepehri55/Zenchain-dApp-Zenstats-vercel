@@ -27,6 +27,7 @@ function toCsvUrl(input) {
 }
 
 // Simple CSV parser (expects columns for discord + wallet/address; header optional)
+// Note: basic splitting by comma; for complex CSVs, publish the sheet to the web (CSV) for clean parsing.
 function parseCsv(text) {
   const lines = String(text || '').replace(/\r/g, '').split('\n').map(l => l.trim()).filter(Boolean);
   if (!lines.length) return [];
@@ -75,6 +76,35 @@ function canonicalizeCategory(c) {
   return c;
 }
 
+// Apply leniency across deficits to maximize completed parts.
+// Only categories with threshold > 0 are considered "parts".
+function allocateLeniency(counts, thresholds, leniencyN) {
+  const parts = Object.keys(thresholds).filter(c => Number(thresholds[c]) > 0);
+
+  const deficits = parts
+    .map(cat => {
+      const need = Math.max(0, Number(thresholds[cat]) - Number(counts?.[cat] || 0));
+      return { cat, need, used: 0 };
+    })
+    .filter(d => d.need > 0)
+    .sort((a, b) => a.need - b.need); // small deficits first to maximize completed parts
+
+  let remaining = Math.max(0, Number(leniencyN || 0));
+  for (const d of deficits) {
+    if (remaining <= 0) break;
+    const take = Math.min(d.need, remaining);
+    d.need -= take;
+    d.used += take;
+    remaining -= take;
+  }
+
+  const missedCats = deficits.filter(d => d.need > 0).map(d => d.cat);
+  const missedAfter = missedCats.length;
+  const leniencyUsed = Math.max(0, Number(leniencyN || 0) - remaining);
+
+  return { missedAfter, missedCats, leniencyUsed };
+}
+
 export default function Admin() {
   // Data input
   const [sheetUrl, setSheetUrl] = useState('');
@@ -95,7 +125,7 @@ export default function Admin() {
     return t;
   });
   const [minTotal, setMinTotal] = useState(0);
-  const [leniency, setLeniency] = useState(0); // NEW: ignore up to N tx across all parts
+  const [leniency, setLeniency] = useState(0); // ignore up to N tx across all parts
   const [groupByDiscord, setGroupByDiscord] = useState(true);
   const [showOnlyWinners, setShowOnlyWinners] = useState(true);
   const [concurrency, setConcurrency] = useState(3);
@@ -156,31 +186,6 @@ export default function Admin() {
     return { counts, total };
   }
 
-  // Apply leniency across deficits to maximize completed parts
-  // Returns number of missed parts AFTER spending leniency, and leniencyUsed
-  function evaluateWithLeniency(counts, thresholds, leniencyN) {
-    const reqCats = Object.keys(thresholds).filter(c => thresholds[c] > 0);
-    const deficits = reqCats
-      .map(c => ({ cat: c, need: Math.max(0, thresholds[c] - (counts[c] || 0)) }))
-      .filter(d => d.need > 0)
-      .sort((a, b) => a.need - b.need);
-
-    let remaining = Math.max(0, Number(leniencyN || 0));
-    for (const d of deficits) {
-      if (remaining <= 0) break;
-      if (d.need <= remaining) {
-        remaining -= d.need;
-        d.need = 0;
-      } else {
-        d.need -= remaining;
-        remaining = 0;
-      }
-    }
-    const missedAfter = deficits.filter(d => d.need > 0).length;
-    const leniencyUsed = Math.max(0, Number(leniencyN || 0) - remaining);
-    return { missedAfter, leniencyUsed };
-  }
-
   async function run() {
     try {
       if (!windowParams) { alert('Pick a valid date range'); return; }
@@ -221,9 +226,9 @@ export default function Admin() {
           const key = r.discord;
           const cur = map.get(key) || { discord: key, wallets: [], counts: {}, total: 0 };
           cur.wallets.push(r.wallet);
-          cur.total += r.total;
+          cur.total += Number(r.total || 0);
           for (const c of Object.keys(r.counts)) {
-            cur.counts[c] = (cur.counts[c] || 0) + (r.counts[c] || 0);
+            cur.counts[c] = (Number(cur.counts[c] || 0) + Number(r.counts[c] || 0));
           }
           map.set(key, cur);
         }
@@ -236,14 +241,16 @@ export default function Admin() {
       }
 
       // Evaluate with leniency and bucket winners into 0/1/2/3 missed parts
-      const reqCats = CATEGORIES.filter(c => thresholds[c] > 0);
       const groups = { 0: [], 1: [], 2: [], 3: [] };
 
       const annotated = grouped.map(r => {
-        const totalOk = Number(minTotal || 0) <= 0 ? true : (r.total >= Number(minTotal));
-        const { missedAfter, leniencyUsed } = evaluateWithLeniency(r.counts, thresholds, leniency);
-        const isWinner = totalOk && missedAfter <= 3; // Winners pages: 0..3 missed parts after leniency
-        const out = { ...r, leniencyUsed, missedParts: missedAfter, totalOk, isWinner };
+        const totalOk = Number(minTotal || 0) <= 0 ? true : (Number(r.total) >= Number(minTotal));
+        const { missedAfter, leniencyUsed, missedCats } = allocateLeniency(r.counts, thresholds, leniency);
+
+        // Winners pages: show 0..3 missed parts AFTER leniency
+        const isWinner = totalOk && missedAfter <= 3;
+        const out = { ...r, leniencyUsed, missedParts: missedAfter, missedCats, totalOk, isWinner };
+
         if (isWinner) {
           if (missedAfter === 0) groups[0].push(out);
           else if (missedAfter === 1) groups[1].push(out);
@@ -267,7 +274,7 @@ export default function Admin() {
 
   function downloadCsv(rows) {
     if (!rows.length) return;
-    const header = ['discord', 'wallets', 'total', ...CATEGORIES, 'leniency_used', 'missed_parts'];
+    const header = ['discord', 'wallets', 'total', ...CATEGORIES, 'leniency_used', 'missed_parts', 'missed_list'];
     const lines = [header.join(',')];
     for (const r of rows) {
       const arr = [
@@ -278,6 +285,7 @@ export default function Admin() {
       for (const c of CATEGORIES) arr.push(r.counts?.[c] || 0);
       arr.push(r.leniencyUsed || 0);
       arr.push(r.missedParts ?? '');
+      arr.push(`"${(r.missedCats || []).join('|').replace(/"/g,'""')}"`);
       lines.push(arr.join(','));
     }
     const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
@@ -458,7 +466,7 @@ export default function Admin() {
               {showOnlyWinners ? 'Winners' : 'All Participants'}
             </h2>
 
-            {/* Winner tabs (0/1/2/3 missed parts) */}
+            {/* Winner tabs (0/1/2/3 missed parts after leniency) */}
             {showOnlyWinners && (
               <div className="flex items-center gap-2 flex-wrap">
                 {[
@@ -515,7 +523,7 @@ export default function Admin() {
                       {CATEGORIES.map(c => (
                         <td key={c} className="px-3 py-2">{r.counts?.[c] || 0}</td>
                       ))}
-                      <td className={`px-3 py-2 ${r.leniencyUsed > 0 ? 'text-emerald-300' : ''}`}>{r.leniencyUsed || 0}</td>
+                      <td className={`px-3 py-2 ${Number(r.leniencyUsed || 0) > 0 ? 'text-emerald-300' : ''}`}>{r.leniencyUsed || 0}</td>
                       <td className="px-3 py-2">{r.missedParts ?? ''}</td>
                     </tr>
                   ))}
