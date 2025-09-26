@@ -2,7 +2,7 @@
 import Head from 'next/head';
 import { useEffect, useMemo, useRef, useState } from 'react';
 
-// Final categories for prizes (ci removed; cco merged into cc)
+// Final prize categories (cco merged into cc, ci removed)
 const CATEGORIES = [
   'stake',
   'native_send',
@@ -12,7 +12,7 @@ const CATEGORIES = [
   'cc',
 ];
 
-// Helper: convert any Google Sheets link to CSV export form
+// Convert Google Sheet link to CSV export form
 function toCsvUrl(input) {
   try {
     const url = new URL(input);
@@ -26,8 +26,7 @@ function toCsvUrl(input) {
   return input;
 }
 
-// Simple CSV parser (expects columns for discord + wallet/address; header optional)
-// Note: basic splitting by comma; for complex CSVs, publish the sheet to the web (CSV) for clean parsing.
+// Simple CSV parser: columns for discord + wallet/address; header optional
 function parseCsv(text) {
   const lines = String(text || '').replace(/\r/g, '').split('\n').map(l => l.trim()).filter(Boolean);
   if (!lines.length) return [];
@@ -50,7 +49,7 @@ function parseCsv(text) {
   return out;
 }
 
-// Concurrency limiter for wallet fetches
+// Concurrency limiter
 function pLimit(concurrency) {
   let active = 0;
   const q = [];
@@ -69,50 +68,101 @@ function pLimit(concurrency) {
     });
 }
 
-// Map site categories so that 'cco' folds into 'cc', and ignore 'ci'
+// Canonicalize categories: merge 'cco' into 'cc', ignore 'ci'
 function canonicalizeCategory(c) {
   if (c === 'cco') return 'cc';
-  if (c === 'ci') return null; // ignore
+  if (c === 'ci') return null;
   return c;
 }
 
-// Apply leniency across deficits to maximize completed parts.
-// Only categories with threshold > 0 are considered "parts".
-function allocateLeniency(counts, thresholds, leniencyN) {
-  const parts = Object.keys(thresholds).filter(c => Number(thresholds[c]) > 0);
+// Count per-category using your existing activity categories (native/external only)
+function computeCounts(activity) {
+  const ext = activity.filter(r => r.kind === 'native');
+  const counts = {};
+  CATEGORIES.forEach(c => (counts[c] = 0));
+  for (const r of ext) {
+    const c0 = canonicalizeCategory(r.category);
+    if (!c0) continue;
+    if (counts[c0] == null) counts[c0] = 0;
+    counts[c0] += 1;
+  }
+  const total = ext.length; // total external tx
+  return { counts, total };
+}
 
-  const deficits = parts
-    .map(cat => {
-      const need = Math.max(0, Number(thresholds[cat]) - Number(counts?.[cat] || 0));
-      return { cat, need, used: 0 };
-    })
-    .filter(d => d.need > 0)
-    .sort((a, b) => a.need - b.need); // small deficits first to maximize completed parts
+// Build raw deficits (NO leniency) across:
+// - all categories with threshold > 0
+// - and "total" if minTotal > 0
+function buildDeficits(counts, thresholds, minTotal, totalCount) {
+  const parts = [];
 
+  // Category parts
+  for (const cat of CATEGORIES) {
+    const need = Math.max(0, Number(thresholds[cat] || 0) - Number(counts?.[cat] || 0));
+    if (Number(thresholds[cat] || 0) > 0 && need > 0) {
+      parts.push({ cat, need, isTotal: false, used: 0 });
+    }
+  }
+
+  // Total part
+  const tMin = Number(minTotal || 0);
+  if (tMin > 0) {
+    const tNeed = Math.max(0, tMin - Number(totalCount || 0));
+    if (tNeed > 0) {
+      parts.push({ cat: 'total', need: tNeed, isTotal: true, used: 0 });
+    }
+  }
+
+  return parts;
+}
+
+// Apply leniency ONLY to category deficits (not to total).
+// Return pre-leniency misses, post-leniency misses, and leniency used.
+function evaluateParticipant(counts, thresholds, minTotal, totalCount, leniencyN) {
+  // First, compute deficits with NO leniency
+  const pre = buildDeficits(counts, thresholds, minTotal, totalCount);
+  const preMissedCats = pre.map(d => d.cat);
+  const preMissed = preMissedCats.length;
+
+  // Split category vs total deficits
+  const catDeficits = pre.filter(d => !d.isTotal).sort((a, b) => a.need - b.need); // greedy small-first
+  const totalDeficit = pre.find(d => d.isTotal); // not lenient
+
+  // Spend leniency on category deficits only
   let remaining = Math.max(0, Number(leniencyN || 0));
-  for (const d of deficits) {
+  for (const d of catDeficits) {
     if (remaining <= 0) break;
     const take = Math.min(d.need, remaining);
     d.need -= take;
     d.used += take;
     remaining -= take;
   }
-
-  const missedCats = deficits.filter(d => d.need > 0).map(d => d.cat);
-  const missedAfter = missedCats.length;
   const leniencyUsed = Math.max(0, Number(leniencyN || 0) - remaining);
 
-  return { missedAfter, missedCats, leniencyUsed };
+  // Parts still missed AFTER leniency
+  const missedCatsAfter = [
+    ...catDeficits.filter(d => d.need > 0).map(d => d.cat),
+    ...(totalDeficit && totalDeficit.need > 0 ? ['total'] : []),
+  ];
+  const missedAfter = missedCatsAfter.length;
+
+  return {
+    preMissed,               // number of parts missed before leniency
+    preMissedCats,           // list of parts missed before leniency
+    missedAfter,             // number of parts missed after leniency
+    missedCatsAfter,         // list of parts missed after leniency
+    leniencyUsed
+  };
 }
 
 export default function Admin() {
-  // Data input
+  // Data source
   const [sheetUrl, setSheetUrl] = useState('');
   const [csvText, setCsvText] = useState('');
   const [loadingSheet, setLoadingSheet] = useState(false);
 
-  // Window
-  const [period, setPeriod] = useState('7d'); // 24h, 7d, 30d, all, custom
+  // Range
+  const [period, setPeriod] = useState('7d');
   const [start, setStart] = useState('');
   const [end, setEnd] = useState('');
   const showingCustom = period === 'custom';
@@ -124,8 +174,8 @@ export default function Admin() {
     CATEGORIES.forEach(c => (t[c] = 0));
     return t;
   });
-  const [minTotal, setMinTotal] = useState(0);
-  const [leniency, setLeniency] = useState(0); // ignore up to N tx across all parts
+  const [minTotal, setMinTotal] = useState(0);   // total external tx threshold
+  const [leniency, setLeniency] = useState(0);   // ignore up to N tx across category parts (not total)
   const [groupByDiscord, setGroupByDiscord] = useState(true);
   const [showOnlyWinners, setShowOnlyWinners] = useState(true);
   const [concurrency, setConcurrency] = useState(3);
@@ -133,9 +183,9 @@ export default function Admin() {
   // Results
   const [status, setStatus] = useState('');
   const [progress, setProgress] = useState({ done: 0, total: 0 });
-  const [results, setResults] = useState([]); // aggregated per discord (if grouping) or per wallet
+  const [results, setResults] = useState([]);             // annotated rows (all)
   const [winnersByGroup, setWinnersByGroup] = useState({ 0: [], 1: [], 2: [], 3: [] });
-  const [winTab, setWinTab] = useState(0); // 0,1,2,3 tabs
+  const [winTab, setWinTab] = useState(0);
   const abortRef = useRef({ aborted: false });
 
   useEffect(() => {
@@ -171,21 +221,6 @@ export default function Admin() {
     }
   }
 
-  // Count per-category using your existing activity categories; merge cco->cc; ignore ci
-  function computeCounts(activity) {
-    const ext = activity.filter(r => r.kind === 'native');
-    const counts = {};
-    CATEGORIES.forEach(c => (counts[c] = 0));
-    for (const r of ext) {
-      const c0 = canonicalizeCategory(r.category);
-      if (!c0) continue;
-      if (counts[c0] == null) counts[c0] = 0;
-      counts[c0] += 1;
-    }
-    const total = ext.length;
-    return { counts, total };
-  }
-
   async function run() {
     try {
       if (!windowParams) { alert('Pick a valid date range'); return; }
@@ -218,7 +253,7 @@ export default function Admin() {
 
       const rows = (await Promise.all(tasks)).filter(Boolean);
 
-      // Group by discord if needed
+      // Group by Discord (sum across wallets)
       let grouped = rows;
       if (groupByDiscord) {
         const map = new Map();
@@ -240,22 +275,22 @@ export default function Admin() {
         }));
       }
 
-      // Evaluate with leniency and bucket winners into 0/1/2/3 missed parts
+      // Evaluate: first compute misses with NO leniency; then apply leniency to categories only
       const groups = { 0: [], 1: [], 2: [], 3: [] };
-
       const annotated = grouped.map(r => {
-        const totalOk = Number(minTotal || 0) <= 0 ? true : (Number(r.total) >= Number(minTotal));
-        const { missedAfter, leniencyUsed, missedCats } = allocateLeniency(r.counts, thresholds, leniency);
+        const evalRes = evaluateParticipant(r.counts, thresholds, minTotal, r.total, leniency);
+        const out = {
+          ...r,
+          leniencyUsed: evalRes.leniencyUsed,
+          preMissed: evalRes.preMissed,
+          preMissedCats: evalRes.preMissedCats,
+          missedParts: evalRes.missedAfter,
+          missedCats: evalRes.missedCatsAfter
+        };
 
-        // Winners pages: show 0..3 missed parts AFTER leniency
-        const isWinner = totalOk && missedAfter <= 3;
-        const out = { ...r, leniencyUsed, missedParts: missedAfter, missedCats, totalOk, isWinner };
-
-        if (isWinner) {
-          if (missedAfter === 0) groups[0].push(out);
-          else if (missedAfter === 1) groups[1].push(out);
-          else if (missedAfter === 2) groups[2].push(out);
-          else if (missedAfter === 3) groups[3].push(out);
+        // Winner tabs are based on missed parts AFTER leniency
+        if (out.missedParts <= 3) {
+          groups[out.missedParts].push(out);
         }
         return out;
       });
@@ -264,7 +299,7 @@ export default function Admin() {
       setWinnersByGroup(groups);
 
       const totals = Object.values(groups).reduce((s, arr) => s + arr.length, 0);
-      setStatus(`Done. Processed ${grouped.length} ${groupByDiscord ? 'participants' : 'wallets'}. Winners: ${totals} (0-miss: ${groups[0].length}, 1-miss: ${groups[1].length}, 2-miss: ${groups[2].length}, 3-miss: ${groups[3].length}).`);
+      setStatus(`Done. Processed ${grouped.length} ${groupByDiscord ? 'participants' : 'wallets'}. Winners: ${totals} (0-miss: ${groups[0].length}, 1-miss: ${groups[1].length}, 2-miss: ${groups[2].length}, 3-miss: ${groups[3].length}). • ${grouped.length} / ${rows.length}`);
     } catch (e) {
       console.error(e);
       alert(e.message || String(e));
@@ -274,7 +309,13 @@ export default function Admin() {
 
   function downloadCsv(rows) {
     if (!rows.length) return;
-    const header = ['discord', 'wallets', 'total', ...CATEGORIES, 'leniency_used', 'missed_parts', 'missed_list'];
+    const header = [
+      'discord', 'wallets', 'total',
+      ...CATEGORIES,
+      'leniency_used',
+      'pre_missed_parts', 'pre_missed_list',
+      'missed_parts', 'missed_list'
+    ];
     const lines = [header.join(',')];
     for (const r of rows) {
       const arr = [
@@ -284,6 +325,8 @@ export default function Admin() {
       ];
       for (const c of CATEGORIES) arr.push(r.counts?.[c] || 0);
       arr.push(r.leniencyUsed || 0);
+      arr.push(r.preMissed || 0);
+      arr.push(`"${(r.preMissedCats || []).join('|').replace(/"/g,'""')}"`);
       arr.push(r.missedParts ?? '');
       arr.push(`"${(r.missedCats || []).join('|').replace(/"/g,'""')}"`);
       lines.push(arr.join(','));
@@ -295,7 +338,6 @@ export default function Admin() {
     a.click();
   }
 
-  // Which rows to show
   const currentWinnerRows = winnersByGroup[winTab] || [];
   const rowsToShow = showOnlyWinners ? currentWinnerRows : results;
 
@@ -314,7 +356,7 @@ export default function Admin() {
       </header>
 
       <main className="max-w-6xl mx-auto p-4">
-        {/* Participants source */}
+        {/* Participants */}
         <section className="glass rounded-xl p-4 border border-slate-800">
           <h2 className="text-lg font-semibold mb-3">Participants</h2>
           <div className="grid gap-3">
@@ -404,7 +446,7 @@ export default function Admin() {
                   value={leniency}
                   onChange={e=>setLeniency(Number(e.target.value))}
                   className="mt-1 w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 min-h-[44px]"
-                  title="We will cover up to N shortfalls across all parts to count a participant as complete"
+                  title="Covers shortfalls across category parts only; not applied to total"
                 />
               </div>
 
@@ -421,6 +463,7 @@ export default function Admin() {
               </div>
             </div>
 
+            {/* Per-category thresholds */}
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2">
               {CATEGORIES.map(cat => (
                 <div key={cat}>
@@ -466,7 +509,7 @@ export default function Admin() {
               {showOnlyWinners ? 'Winners' : 'All Participants'}
             </h2>
 
-            {/* Winner tabs (0/1/2/3 missed parts after leniency) */}
+            {/* Tabs: 0/1/2/3 missed parts AFTER leniency (total counts as a part; not lenient) */}
             {showOnlyWinners && (
               <div className="flex items-center gap-2 flex-wrap">
                 {[
@@ -534,7 +577,7 @@ export default function Admin() {
         </section>
 
         <footer className="text-slate-400 text-sm mt-8 pb-safe">
-          Notes: cc includes both direct deploys and CCO (merged). ci is excluded. Leniency covers total shortfalls across all thresholded categories; min total is not lenient.
+          Notes: cc includes direct deploys and CCO (merged). “Total external tx” is counted as an additional part if its threshold is set; leniency never covers total, only category shortfalls.
         </footer>
       </main>
     </div>
