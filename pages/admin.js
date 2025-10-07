@@ -2,7 +2,7 @@
 import Head from 'next/head';
 import { useEffect, useMemo, useRef, useState } from 'react';
 
-// Prize categories (cco merged into cc, ci ignored)
+// Prize categories (cco merged into cc, ci ignored; approve is display-only on main site)
 const CATEGORIES = [
   'stake',
   'native_send',
@@ -85,11 +85,11 @@ function computeCounts(activity) {
   CATEGORIES.forEach(c => (counts[c] = 0));
   for (const r of ext) {
     const c0 = canonicalizeCategory(r.category);
-    if (!c0) continue;
+    if (!c0) continue;                 // ignore ci / null categories
     if (counts[c0] == null) counts[c0] = 0;
     counts[c0] += 1;
   }
-  const total = ext.length; // total external tx
+  const total = ext.length;            // total external tx
   return { counts, total };
 }
 

@@ -1,3 +1,4 @@
+// pages/api/activity.js
 import { parseRange, buildActivity } from '../../lib/shared';
 
 export default async function handler(req, res) {
@@ -8,8 +9,16 @@ export default async function handler(req, res) {
     }
     const { start, end } = parseRange(req.query);
     const activity = await buildActivity({ address, start, end });
+
+    // Includes new categories emitted by buildActivity:
+    // swap, add_liquidity, remove_liquidity, approve (+ all existing)
     res.setHeader('Cache-Control', 's-maxage=15, stale-while-revalidate=30');
-    return res.json({ address: address.toLowerCase(), window: { start, end }, count: activity.length, activity });
+    return res.json({
+      address: address.toLowerCase(),
+      window: { start, end },
+      count: activity.length,
+      activity
+    });
   } catch (e) {
     return res.status(500).json({ error: e.message || String(e) });
   }

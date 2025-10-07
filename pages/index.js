@@ -47,6 +47,7 @@ export default function Home() {
   function parseLocalDT(s) { return Math.floor(new Date(s).getTime()/1000); }
 
   function catBadge(c) {
+    // colors for all categories we use
     const map = {
       domain_mint:      'bg-lime-800/35 text-lime-300 ring-1 ring-lime-400/30',
       nft_mint:         'bg-violet-800/35 text-violet-300 ring-1 ring-violet-400/30',
@@ -63,8 +64,9 @@ export default function Home() {
       fail:             'bg-red-800/35 text-red-300 ring-1 ring-red-400/30',
       other:            'bg-slate-800 text-slate-300 ring-1 ring-slate-600/30'
     };
-    const cls = map[c] || map.other;
-    return <span className={`text-[11px] px-2 py-1 rounded ${cls}`}>{(c || '').replace('_',' ')}</span>;
+    const key = (c || 'other');
+    const cls = map[key] || map.other;
+    return <span className={`text-[11px] px-2 py-1 rounded ${cls}`}>{String(key).replace(/_/g,' ')}</span>;
   }
 
   function computeBotFlags(rows) {
@@ -209,7 +211,6 @@ export default function Home() {
       setStatus('Loading… (large windows can take longer)');
       setPage(1);
 
-      // Abort any previous run
       const ac = new AbortController();
       const sFetch = fetch(statsUrl, { signal: ac.signal });
       const aFetch = fetch(actUrl, { signal: ac.signal });
@@ -295,15 +296,18 @@ export default function Home() {
         </section>
 
         {/* KPIs */}
-        <section className="mt-6 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-4">
+        <section className="mt-6 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-10 gap-4">
           {kpis && ([
-            { label: 'Stake Actions', value: kpis.stakeActions, emoji: '🪙' },
+            { label: 'Stake Actions',    value: kpis.stakeActions, emoji: '🪙' },
             { label: 'Native Sends (ZTC)', value: kpis.nativeSends, emoji: '📤' },
-            { label: 'NFT Mints', value: kpis.nftMints, emoji: '🖼️' },
-            { label: 'Domain Mints', value: kpis.domainMints, emoji: '🌐' },
+            { label: 'NFT Mints',        value: kpis.nftMints, emoji: '🖼️' },
+            { label: 'Domain Mints',     value: kpis.domainMints, emoji: '🌐' },
             { label: 'Deploys (CC+CCO)', value: kpis.ccCount, emoji: '🛠️' },
-            { label: 'On‑chain GM', value: kpis.gmCount, emoji: '🌞' },
-            { label: 'Bridged', value: 'Coming soon', emoji: '' }
+            { label: 'On‑chain GM',      value: kpis.gmCount, emoji: '🌞' },
+            { label: 'Swaps',            value: kpis.swapCount ?? 0, emoji: '🔄' },
+            { label: 'Add Liquidity',    value: kpis.addLiquidityCount ?? 0, emoji: '💧➕' },
+            { label: 'Remove Liquidity', value: kpis.removeLiquidityCount ?? 0, emoji: '💧➖' },
+            { label: 'Bridged',          value: 'Coming soon', emoji: '' }
           ].map((c, i) => (
             <div key={i} className="glass border border-slate-800 rounded-xl p-4 text-center">
               <div className="text-xs sm:text-sm text-slate-300">{c.label}</div>

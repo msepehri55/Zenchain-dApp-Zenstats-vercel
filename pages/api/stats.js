@@ -9,8 +9,14 @@ export default async function handler(req, res) {
     }
     const { start, end } = parseRange(req.query);
     const kpis = await buildStats({ address, start, end });
+
+    // Derived from buildActivity to avoid drift and double counting
     res.setHeader('Cache-Control', 's-maxage=15, stale-while-revalidate=30');
-    return res.json({ address: address.toLowerCase(), window: { start, end }, kpis });
+    return res.json({
+      address: address.toLowerCase(),
+      window: { start, end },
+      kpis
+    });
   } catch (e) {
     return res.status(500).json({ error: e.message || String(e) });
   }
