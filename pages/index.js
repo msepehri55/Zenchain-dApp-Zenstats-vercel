@@ -48,16 +48,20 @@ export default function Home() {
 
   function catBadge(c) {
     const map = {
-      domain_mint: 'bg-lime-800/35 text-lime-300 ring-1 ring-lime-400/30',
-      nft_mint:    'bg-violet-800/35 text-violet-300 ring-1 ring-violet-400/30',
-      stake:       'bg-teal-800/35 text-teal-300 ring-1 ring-teal-400/30',
-      gm:          'bg-indigo-800/35 text-indigo-300 ring-1 ring-indigo-400/30',
-      native_send: 'bg-amber-800/35 text-amber-300 ring-1 ring-amber-400/30',
-      cc:          'bg-rose-800/35 text-rose-300 ring-1 ring-rose-400/30',
-      cco:         'bg-fuchsia-800/35 text-fuchsia-300 ring-1 ring-fuchsia-400/30',
-      ci:          'bg-cyan-800/35 text-cyan-300 ring-1 ring-cyan-400/30',
-      fail:        'bg-red-800/35 text-red-300 ring-1 ring-red-400/30',
-      other:       'bg-slate-800 text-slate-300 ring-1 ring-slate-600/30'
+      domain_mint:      'bg-lime-800/35 text-lime-300 ring-1 ring-lime-400/30',
+      nft_mint:         'bg-violet-800/35 text-violet-300 ring-1 ring-violet-400/30',
+      stake:            'bg-teal-800/35 text-teal-300 ring-1 ring-teal-400/30',
+      gm:               'bg-indigo-800/35 text-indigo-300 ring-1 ring-indigo-400/30',
+      native_send:      'bg-amber-800/35 text-amber-300 ring-1 ring-amber-400/30',
+      cc:               'bg-rose-800/35 text-rose-300 ring-1 ring-rose-400/30',
+      cco:              'bg-fuchsia-800/35 text-fuchsia-300 ring-1 ring-fuchsia-400/30',
+      ci:               'bg-cyan-800/35 text-cyan-300 ring-1 ring-cyan-400/30',
+      swap:             'bg-sky-800/35 text-sky-300 ring-1 ring-sky-400/30',
+      add_liquidity:    'bg-emerald-800/35 text-emerald-300 ring-1 ring-emerald-400/30',
+      remove_liquidity: 'bg-orange-800/35 text-orange-300 ring-1 ring-orange-400/30',
+      approve:          'bg-blue-800/35 text-blue-300 ring-1 ring-blue-400/30',
+      fail:             'bg-red-800/35 text-red-300 ring-1 ring-red-400/30',
+      other:            'bg-slate-800 text-slate-300 ring-1 ring-slate-600/30'
     };
     const cls = map[c] || map.other;
     return <span className={`text-[11px] px-2 py-1 rounded ${cls}`}>{(c || '').replace('_',' ')}</span>;
@@ -321,6 +325,10 @@ export default function Home() {
                   <option value="domain_mint">Category: Domain mint</option>
                   <option value="stake">Category: Stake</option>
                   <option value="gm">Category: GM</option>
+                  <option value="swap">Category: Swap</option>
+                  <option value="add_liquidity">Category: Add Liquidity</option>
+                  <option value="remove_liquidity">Category: Remove Liquidity</option>
+                  <option value="approve">Category: Approve</option>
                   <option value="native_send">Category: Native send</option>
                   <option value="cc">Category: CC (deploy)</option>
                   <option value="cco">Category: CCO (deploy via 0x016e...8be0)</option>

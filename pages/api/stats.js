@@ -1,3 +1,4 @@
+// pages/api/stats.js
 import { parseRange, buildStats } from '../../lib/shared';
 
 export default async function handler(req, res) {
