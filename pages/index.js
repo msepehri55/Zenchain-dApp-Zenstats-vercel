@@ -9,9 +9,10 @@ export default function Home() {
   const [status, setStatus] = useState('');
   const [kpis, setKpis] = useState(null);
   const [activity, setActivity] = useState([]);
+  const [breakdown, setBreakdown] = useState(null); // { external, externalOut, externalIn, all }
 
   const [cat, setCat] = useState('all');
-  const [dir, setDir] = useState('out');
+  const [dir, setDir] = useState('all'); // default to All to match counts
   const [sort, setSort] = useState('time.desc');
   const [botSec, setBotSec] = useState(5);
 
@@ -47,7 +48,6 @@ export default function Home() {
   function parseLocalDT(s) { return Math.floor(new Date(s).getTime()/1000); }
 
   function catBadge(c) {
-    // colors for all categories we use
     const map = {
       domain_mint:      'bg-lime-800/35 text-lime-300 ring-1 ring-lime-400/30',
       nft_mint:         'bg-violet-800/35 text-violet-300 ring-1 ring-violet-400/30',
@@ -211,6 +211,7 @@ export default function Home() {
       setStatus('Loading… (large windows can take longer)');
       setPage(1);
 
+      // Abort any previous run
       const ac = new AbortController();
       const sFetch = fetch(statsUrl, { signal: ac.signal });
       const aFetch = fetch(actUrl, { signal: ac.signal });
@@ -221,16 +222,23 @@ export default function Home() {
 
       setKpis(sJson.kpis || null);
       setActivity(aJson.activity || []);
+      setBreakdown(aJson.breakdown || null);
+
       const w = sJson.window || aJson.window || {};
       const st = w.start ? new Date(w.start*1000).toLocaleString() : '';
       const en = w.end   ? new Date(w.end*1000).toLocaleString() : '';
-      setStatus(`Window: ${st} → ${en} • ${aJson.count || 0} rows`);
+      setStatus(`Window: ${st} → ${en}`);
     } catch (e) {
       console.error(e);
       alert(e.message || String(e));
       setStatus('');
     }
   }
+
+  const visibleCount = filteredSortedRows.length;
+  const externalCount = breakdown?.external ?? 0;
+  const externalOut = breakdown?.externalOut ?? 0;
+  const externalIn = breakdown?.externalIn ?? 0;
 
   return (
     <div className="min-h-screen text-slate-100">
@@ -293,6 +301,13 @@ export default function Home() {
             </button>
           </div>
           <p className="mt-3 text-sm text-slate-300" aria-live="polite">{status}</p>
+
+          {/* Live counts summary from server (pre-filter) + visible rows (post-filter) */}
+          {breakdown && (
+            <p className="mt-1 text-xs sm:text-sm text-slate-400">
+              External tx: {externalCount} (out {externalOut} / in {externalIn}) • Visible rows with current filters: {visibleCount}
+            </p>
+          )}
         </section>
 
         {/* KPIs */}
@@ -341,8 +356,8 @@ export default function Home() {
                   <option value="other">Category: Other</option>
                 </select>
                 <select value={dir} onChange={e=>{setDir(e.target.value); setPage(1);}} className="px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 min-h-[40px]">
-                  <option value="out">Direction: Out</option>
                   <option value="all">Direction: All</option>
+                  <option value="out">Direction: Out</option>
                   <option value="in">Direction: In</option>
                 </select>
                 <select value={sort} onChange={e=>{setSort(e.target.value); setPage(1);}} className="px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 min-h-[40px]">

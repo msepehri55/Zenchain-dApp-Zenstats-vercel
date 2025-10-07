@@ -10,13 +10,24 @@ export default async function handler(req, res) {
     const { start, end } = parseRange(req.query);
     const activity = await buildActivity({ address, start, end });
 
-    // Includes new categories emitted by buildActivity:
-    // swap, add_liquidity, remove_liquidity, approve (+ all existing)
+    // Only external/native tx for the main count (what users expect)
+    const external = activity.filter(r => r.kind === 'native');
+    const externalOut = external.filter(r => r.direction === 'out').length;
+    const externalIn  = external.filter(r => r.direction === 'in').length;
+
     res.setHeader('Cache-Control', 's-maxage=15, stale-while-revalidate=30');
     return res.json({
       address: address.toLowerCase(),
       window: { start, end },
-      count: activity.length,
+      // count = unique external tx; total = all unique tx (external + token + internal)
+      count: external.length,
+      total: activity.length,
+      breakdown: {
+        external: external.length,
+        externalOut,
+        externalIn,
+        all: activity.length,
+      },
       activity
     });
   } catch (e) {
