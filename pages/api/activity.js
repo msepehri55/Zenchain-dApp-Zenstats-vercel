@@ -10,23 +10,21 @@ export default async function handler(req, res) {
     const { start, end } = parseRange(req.query);
     const activity = await buildActivity({ address, start, end });
 
-    // Only external/native tx for the main count (what users expect)
+    // Original behavior: count only OUTGOING external (native) tx
     const external = activity.filter(r => r.kind === 'native');
-    const externalOut = external.filter(r => r.direction === 'out').length;
-    const externalIn  = external.filter(r => r.direction === 'in').length;
+    const externalOut = external.filter(r => r.direction === 'out');
+    const externalIn  = external.filter(r => r.direction === 'in');
 
     res.setHeader('Cache-Control', 's-maxage=15, stale-while-revalidate=30');
     return res.json({
       address: address.toLowerCase(),
       window: { start, end },
-      // count = unique external tx; total = all unique tx (external + token + internal)
-      count: external.length,
-      total: activity.length,
+      count: externalOut.length,       // << main count = OUTGOING external only
       breakdown: {
-        external: external.length,
-        externalOut,
-        externalIn,
-        all: activity.length,
+        externalOut: externalOut.length,
+        externalIn: externalIn.length,
+        externalAll: external.length,
+        allUniqueRows: activity.length
       },
       activity
     });

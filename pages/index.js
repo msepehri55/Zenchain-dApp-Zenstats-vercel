@@ -9,10 +9,10 @@ export default function Home() {
   const [status, setStatus] = useState('');
   const [kpis, setKpis] = useState(null);
   const [activity, setActivity] = useState([]);
-  const [breakdown, setBreakdown] = useState(null); // { external, externalOut, externalIn, all }
+  const [breakdown, setBreakdown] = useState(null); // { externalOut, externalIn, externalAll, allUniqueRows }
 
   const [cat, setCat] = useState('all');
-  const [dir, setDir] = useState('all'); // default to All to match counts
+  const [dir, setDir] = useState('out'); // default OUT (original behavior)
   const [sort, setSort] = useState('time.desc');
   const [botSec, setBotSec] = useState(5);
 
@@ -47,7 +47,12 @@ export default function Home() {
   function shortAddr(a) { return a ? a.slice(0,8) + '…' + a.slice(-6) : ''; }
   function parseLocalDT(s) { return Math.floor(new Date(s).getTime()/1000); }
 
-  function catBadge(c) {
+  function tag(text, cls) {
+    return <span className={`text-[10px] px-2 py-0.5 rounded ${cls}`}>{text}</span>;
+  }
+
+  function catBadge(c, kind) {
+    // colors for activity categories; provide fallback for tokens/internals
     const map = {
       domain_mint:      'bg-lime-800/35 text-lime-300 ring-1 ring-lime-400/30',
       nft_mint:         'bg-violet-800/35 text-violet-300 ring-1 ring-violet-400/30',
@@ -56,17 +61,32 @@ export default function Home() {
       native_send:      'bg-amber-800/35 text-amber-300 ring-1 ring-amber-400/30',
       cc:               'bg-rose-800/35 text-rose-300 ring-1 ring-rose-400/30',
       cco:              'bg-fuchsia-800/35 text-fuchsia-300 ring-1 ring-fuchsia-400/30',
-      ci:               'bg-cyan-800/35 text-cyan-300 ring-1 ring-cyan-400/30',
       swap:             'bg-sky-800/35 text-sky-300 ring-1 ring-sky-400/30',
       add_liquidity:    'bg-emerald-800/35 text-emerald-300 ring-1 ring-emerald-400/30',
       remove_liquidity: 'bg-orange-800/35 text-orange-300 ring-1 ring-orange-400/30',
       approve:          'bg-blue-800/35 text-blue-300 ring-1 ring-blue-400/30',
       fail:             'bg-red-800/35 text-red-300 ring-1 ring-red-400/30',
-      other:            'bg-slate-800 text-slate-300 ring-1 ring-slate-600/30'
+      other:            'bg-slate-800 text-slate-300 ring-1 ring-slate-600/30',
+      // non-category kinds (for token/internal)
+      erc20:            'bg-slate-800/60 text-slate-300 ring-1 ring-slate-600/30',
+      erc721:           'bg-slate-800/60 text-slate-300 ring-1 ring-slate-600/30',
+      internal:         'bg-slate-800/60 text-slate-300 ring-1 ring-slate-600/30',
     };
-    const key = (c || 'other');
-    const cls = map[key] || map.other;
-    return <span className={`text-[11px] px-2 py-1 rounded ${cls}`}>{String(key).replace(/_/g,' ')}</span>;
+
+    // If category exists, use it; otherwise show kind tag for token/internal
+    if (c) {
+      const key = String(c);
+      const cls = map[key] || map.other;
+      return tag(key.replace(/_/g, ' '), cls);
+    }
+    if (kind === 'token') {
+      return tag('token', map.erc20);
+    }
+    if (kind === 'internal') {
+      return tag('internal', map.internal);
+    }
+    // fallback
+    return tag('other', map.other);
   }
 
   function computeBotFlags(rows) {
@@ -84,10 +104,10 @@ export default function Home() {
   }
 
   const filteredSortedRows = useMemo(() => {
-    let rows = [...activity];
-    if (cat !== 'all') rows = rows.filter(r => (r.category || 'none') === cat);
-    if (dir !== 'all') rows = rows.filter(r => r.direction === dir);
-    const [key, d] = sort.split('.');
+    let rows = Array.isArray(activity) ? [...activity] : [];
+    if (cat !== 'all') rows = rows.filter(r => (r.category || 'other') === cat);
+    if (dir !== 'all') rows = rows.filter(r => (r.direction || '') === dir);
+    const [key, d] = String(sort).split('.');
     rows.sort((a,b) => {
       if (key === 'time') return d === 'desc' ? b.timeMs - a.timeMs : a.timeMs - b.timeMs;
       if (key === 'value') return d === 'desc'
@@ -111,20 +131,30 @@ export default function Home() {
     if (!pageRows.length) return <p className="text-slate-300">No records in this window.</p>;
     const trs = pageRows.map(r => {
       const txUrl = 'https://zentrace.io/tx/' + (r.hash || '');
-      const fromUrl = 'https://zentrace.io/address/' + (r.from || '');
-      const toUrl = 'https://zentrace.io/address/' + (r.to || '');
+      const fromUrl = r.from ? 'https://zentrace.io/address/' + r.from : '#';
+      const toUrl = r.to ? 'https://zentrace.io/address/' + r.to : '#';
       const amt = r.kind === 'native' || r.kind === 'internal'
-        ? (r.value + ' ZTC')
-        : (r.standard === 'erc20' ? `${r.amount} ${r.symbol || 'TOKEN'}` : (r.standard === 'erc721' ? `tokenId ${r.tokenId || ''} ${r.symbol || 'NFT'}` : ''));
+        ? ((r.value ?? '0') + ' ZTC')
+        : (r.standard === 'erc20' ? `${r.amount ?? '0'} ${r.symbol || 'TOKEN'}`
+                                  : (r.standard === 'erc721' ? `tokenId ${r.tokenId || ''} ${r.symbol || 'NFT'}`
+                                                             : ''));
       const highlight = botFlags.has(r.hash) ? 'bg-amber-900/20' : '';
       return (
         <tr key={r.hash} className={`border-b border-slate-800 ${highlight}`}>
           <td className="px-3 py-2">{fmtTime(r.timeMs)}</td>
-          <td className="px-3 py-2">{r.category ? <>{catBadge(r.category)} </> : null}<span className="text-xs text-slate-400">{r.direction || ''}</span></td>
-          <td className="px-3 py-2 font-mono"><a className="text-emerald-300 hover:underline" href={txUrl} target="_blank" rel="noreferrer">{shortHash(r.hash)}</a></td>
-          <td className="px-3 py-2 font-mono"><a className="text-emerald-300 hover:underline" href={fromUrl} target="_blank" rel="noreferrer">{shortAddr(r.from)}</a></td>
-          <td className="px-3 py-2 font-mono"><a className="text-emerald-300 hover:underline" href={toUrl} target="_blank" rel="noreferrer">{shortAddr(r.to)}</a></td>
-          <td className="px-3 py-2 font-mono">{amt}</td>
+          <td className="px-3 py-2">
+            {catBadge(r.category, r.kind)} <span className="text-xs text-slate-400">{r.direction || ''}</span>
+          </td>
+          <td className="px-3 py-2 font-mono">
+            <a className="text-emerald-300 hover:underline" href={txUrl} target="_blank" rel="noreferrer">{shortHash(r.hash)}</a>
+          </td>
+          <td className="px-3 py-2 font-mono">
+            {r.from ? <a className="text-emerald-300 hover:underline" href={fromUrl} target="_blank" rel="noreferrer">{shortAddr(r.from)}</a> : <span className="text-slate-400">-</span>}
+          </td>
+          <td className="px-3 py-2 font-mono">
+            {r.to ? <a className="text-emerald-300 hover:underline" href={toUrl} target="_blank" rel="noreferrer">{shortAddr(r.to)}</a> : <span className="text-slate-400">-</span>}
+          </td>
+          <td className="px-3 py-2 font-mono">{amt || '-'}</td>
         </tr>
       );
     });
@@ -153,11 +183,13 @@ export default function Home() {
       <div className="grid gap-2">
         {pageRows.map(r => {
           const txUrl = 'https://zentrace.io/tx/' + (r.hash || '');
-          const fromUrl = 'https://zentrace.io/address/' + (r.from || '');
-          const toUrl = 'https://zentrace.io/address/' + (r.to || '');
+          const fromUrl = r.from ? 'https://zentrace.io/address/' + r.from : '#';
+          const toUrl = r.to ? 'https://zentrace.io/address/' + r.to : '#';
           const amt = r.kind === 'native' || r.kind === 'internal'
-            ? (r.value + ' ZTC')
-            : (r.standard === 'erc20' ? `${r.amount} ${r.symbol || 'TOKEN'}` : (r.standard === 'erc721' ? `tokenId ${r.tokenId || ''} ${r.symbol || 'NFT'}` : ''));
+            ? ((r.value ?? '0') + ' ZTC')
+            : (r.standard === 'erc20' ? `${r.amount ?? '0'} ${r.symbol || 'TOKEN'}`
+                                      : (r.standard === 'erc721' ? `tokenId ${r.tokenId || ''} ${r.symbol || 'NFT'}`
+                                                                 : ''));
           const highlight = botFlags.has(r.hash) ? 'ring-1 ring-amber-500/40' : '';
 
           return (
@@ -165,7 +197,7 @@ export default function Home() {
               <div className="flex items-center justify-between">
                 <div className="text-xs text-slate-400">{fmtTime(r.timeMs)}</div>
                 <div className="flex items-center gap-2">
-                  {r.category ? catBadge(r.category) : null}
+                  {catBadge(r.category, r.kind)}
                   <span className="text-[10px] text-slate-400">{r.direction || ''}</span>
                 </div>
               </div>
@@ -176,15 +208,19 @@ export default function Home() {
                 </div>
                 <div className="mt-1 flex items-center gap-2">
                   <span className="text-slate-400">From:</span>
-                  <a className="font-mono text-emerald-300 hover:underline" href={fromUrl} target="_blank" rel="noreferrer">{shortAddr(r.from)}</a>
+                  {r.from ? (
+                    <a className="font-mono text-emerald-300 hover:underline" href={fromUrl} target="_blank" rel="noreferrer">{shortAddr(r.from)}</a>
+                  ) : <span className="font-mono text-slate-400">-</span>}
                 </div>
                 <div className="mt-1 flex items-center gap-2">
                   <span className="text-slate-400">To:</span>
-                  <a className="font-mono text-emerald-300 hover:underline" href={toUrl} target="_blank" rel="noreferrer">{shortAddr(r.to)}</a>
+                  {r.to ? (
+                    <a className="font-mono text-emerald-300 hover:underline" href={toUrl} target="_blank" rel="noreferrer">{shortAddr(r.to)}</a>
+                  ) : <span className="font-mono text-slate-400">-</span>}
                 </div>
                 <div className="mt-1 flex items-center gap-2">
                   <span className="text-slate-400">Amount:</span>
-                  <span className="font-mono">{amt}</span>
+                  <span className="font-mono">{amt || '-'}</span>
                 </div>
               </div>
             </div>
@@ -211,23 +247,21 @@ export default function Home() {
       setStatus('Loading… (large windows can take longer)');
       setPage(1);
 
-      // Abort any previous run
-      const ac = new AbortController();
-      const sFetch = fetch(statsUrl, { signal: ac.signal });
-      const aFetch = fetch(actUrl, { signal: ac.signal });
-      const [sRes, aRes] = await Promise.all([sFetch, aFetch]);
+      // Fetch stats + activity
+      const [sRes, aRes] = await Promise.all([fetch(statsUrl), fetch(actUrl)]);
       const [sJson, aJson] = await Promise.all([sRes.json(), aRes.json()]);
       if (!sRes.ok) throw new Error(sJson.error || 'Stats failed');
       if (!aRes.ok) throw new Error(aJson.error || 'Activity failed');
 
       setKpis(sJson.kpis || null);
-      setActivity(aJson.activity || []);
+      setActivity(Array.isArray(aJson.activity) ? aJson.activity : []);
       setBreakdown(aJson.breakdown || null);
 
       const w = sJson.window || aJson.window || {};
       const st = w.start ? new Date(w.start*1000).toLocaleString() : '';
       const en = w.end   ? new Date(w.end*1000).toLocaleString() : '';
-      setStatus(`Window: ${st} → ${en}`);
+      // Show EXACT count from server (outgoing external only)
+      setStatus(`Window: ${st} → ${en} • External OUT tx: ${aJson.count ?? 0}`);
     } catch (e) {
       console.error(e);
       alert(e.message || String(e));
@@ -236,9 +270,6 @@ export default function Home() {
   }
 
   const visibleCount = filteredSortedRows.length;
-  const externalCount = breakdown?.external ?? 0;
-  const externalOut = breakdown?.externalOut ?? 0;
-  const externalIn = breakdown?.externalIn ?? 0;
 
   return (
     <div className="min-h-screen text-slate-100">
@@ -301,16 +332,13 @@ export default function Home() {
             </button>
           </div>
           <p className="mt-3 text-sm text-slate-300" aria-live="polite">{status}</p>
-
-          {/* Live counts summary from server (pre-filter) + visible rows (post-filter) */}
-          {breakdown && (
-            <p className="mt-1 text-xs sm:text-sm text-slate-400">
-              External tx: {externalCount} (out {externalOut} / in {externalIn}) • Visible rows with current filters: {visibleCount}
-            </p>
-          )}
+          {/* Helpful note on what is currently visible after filters */}
+          <p className="mt-1 text-xs sm:text-sm text-slate-400">
+            Visible rows with current filters: {visibleCount}
+          </p>
         </section>
 
-        {/* KPIs */}
+        {/* KPIs (derived on server from OUTGOING external only) */}
         <section className="mt-6 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-10 gap-4">
           {kpis && ([
             { label: 'Stake Actions',    value: kpis.stakeActions, emoji: '🪙' },
@@ -351,13 +379,12 @@ export default function Home() {
                   <option value="native_send">Category: Native send</option>
                   <option value="cc">Category: CC (deploy)</option>
                   <option value="cco">Category: CCO (deploy via 0x016e...8be0)</option>
-                  <option value="ci">Category: CI (interact)</option>
                   <option value="fail">Category: Fail</option>
                   <option value="other">Category: Other</option>
                 </select>
                 <select value={dir} onChange={e=>{setDir(e.target.value); setPage(1);}} className="px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 min-h-[40px]">
-                  <option value="all">Direction: All</option>
                   <option value="out">Direction: Out</option>
+                  <option value="all">Direction: All</option>
                   <option value="in">Direction: In</option>
                 </select>
                 <select value={sort} onChange={e=>{setSort(e.target.value); setPage(1);}} className="px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 min-h-[40px]">
