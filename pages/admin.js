@@ -78,24 +78,24 @@ function canonicalizeCategory(c) {
   return c;
 }
 
-// Count per category from activity (native/external only)
+// Count per category from activity (OUTGOING external native only, exclude fails)
+// This matches the main site's KPIs logic.
 function computeCounts(activity) {
-  const ext = (Array.isArray(activity) ? activity : []).filter(r => r.kind === 'native');
+  const extOut = (Array.isArray(activity) ? activity : [])
+    .filter(r => r.kind === 'native' && r.direction === 'out' && r.category !== 'fail');
   const counts = {};
   CATEGORIES.forEach(c => (counts[c] = 0));
-  for (const r of ext) {
+  for (const r of extOut) {
     const c0 = canonicalizeCategory(r.category);
-    if (!c0) continue;                 // ignore ci / null categories
+    if (!c0) continue; // ignore ci/null
     if (counts[c0] == null) counts[c0] = 0;
     counts[c0] += 1;
   }
-  const total = ext.length;            // total external tx
+  const total = extOut.length; // total = only outgoing external native
   return { counts, total };
 }
 
-// Build raw deficits (no leniency) for:
-// - every category with threshold > 0
-// - and "total" if minTotal > 0
+// Build raw deficits (no leniency) for categories+total
 function buildDeficits(counts, thresholds, minTotal, totalCount) {
   const parts = [];
 
@@ -119,7 +119,7 @@ function buildDeficits(counts, thresholds, minTotal, totalCount) {
   return parts;
 }
 
-// Apply leniency only to category deficits (not total)
+// Apply leniency only to categories (not total)
 function evaluateParticipant(counts, thresholds, minTotal, totalCount, leniencyN) {
   const pre = buildDeficits(counts, thresholds, minTotal, totalCount);
   const preMissedCats = pre.map(d => d.cat);
@@ -172,16 +172,16 @@ export default function Admin() {
     CATEGORIES.forEach(c => (t[c] = 0));
     return t;
   });
-  const [minTotal, setMinTotal] = useState(0);
+  const [minTotal, setMinTotal] = useState(0); // total = OUTGOING externals only
   const [leniency, setLeniency] = useState(0);
   const [groupByDiscord, setGroupByDiscord] = useState(true);
   const [showOnlyWinners, setShowOnlyWinners] = useState(true);
-  const [concurrency, setConcurrency] = useState(3);
+  const [concurrency, setConcurrency] = useState(5); // a bit higher default for speed
 
   // Results
   const [status, setStatus] = useState('');
   const [progress, setProgress] = useState({ done: 0, total: 0 });
-  const [results, setResults] = useState([]);
+  const [results, setResults] = useState([]); // annotated rows
   const [winnersByGroup, setWinnersByGroup] = useState({ 0: [], 1: [], 2: [], 3: [] });
   const [winTab, setWinTab] = useState(0);
   const abortRef = useRef({ aborted: false });
@@ -219,21 +219,34 @@ export default function Admin() {
     }
   }
 
+  // SPEED: de-duplicate wallet fetches. We fetch each unique wallet once, then aggregate by Discord.
   async function run() {
     try {
       if (!windowParams) { alert('Pick a valid date range'); return; }
-      const list = parseCsv(csvText);
-      if (!list.length) { alert('No valid (discord, wallet) rows found in CSV'); return; }
+      const rawList = parseCsv(csvText);
+      if (!rawList.length) { alert('No valid (discord, wallet) rows found in CSV'); return; }
 
-      setStatus('Querying wallets...');
-      setProgress({ done: 0, total: list.length });
+      // Build discord -> wallets map and unique wallet list (dedup speeds things up)
+      const discToWallets = new Map();
+      for (const row of rawList) {
+        const d = row.discord.trim();
+        const w = row.wallet.toLowerCase();
+        if (!discToWallets.has(d)) discToWallets.set(d, new Set());
+        discToWallets.get(d).add(w);
+      }
+      const uniqueWallets = [...new Set(rawList.map(r => r.wallet.toLowerCase()))];
+
+      setStatus('Querying wallets (deduplicated)…');
+      setProgress({ done: 0, total: uniqueWallets.length });
       setResults([]);
       setWinnersByGroup({ 0: [], 1: [], 2: [], 3: [] });
       abortRef.current.aborted = false;
 
-      const limit = pLimit(Math.max(1, Number(concurrency) || 3));
+      const limit = pLimit(Math.max(1, Number(concurrency) || 4));
 
-      const tasks = list.map(({ discord, wallet }) =>
+      // Fetch each unique wallet once
+      const walletResults = new Map(); // wallet -> { counts, total }
+      const tasks = uniqueWallets.map((wallet) =>
         limit(async () => {
           if (abortRef.current.aborted) return null;
           const qs = `start=${windowParams.start}&end=${windowParams.end}`;
@@ -241,36 +254,47 @@ export default function Admin() {
           const r = await fetch(url);
           const j = await r.json();
           if (!r.ok) throw new Error(j?.error || 'activity failed');
+
           const { counts, total } = computeCounts(j.activity || []);
-          return { discord, wallet, counts, total };
+          return { wallet, counts, total };
         }).then((res) => {
           setProgress(p => ({ done: p.done + 1, total: p.total }));
+          if (res) walletResults.set(res.wallet, res);
           return res;
         })
       );
 
-      const rows = (await Promise.all(tasks)).filter(Boolean);
+      await Promise.all(tasks);
 
-      // Group by Discord
-      let grouped = rows;
+      // Aggregate by Discord (sum across that Discord's wallets), or keep per wallet if grouping=off
+      let grouped = [];
       if (groupByDiscord) {
-        const map = new Map();
-        for (const r of rows) {
-          const key = r.discord;
-          const cur = map.get(key) || { discord: key, wallets: [], counts: {}, total: 0 };
-          cur.wallets.push(r.wallet);
-          cur.total += Number(r.total || 0);
-          for (const c of Object.keys(r.counts)) {
-            cur.counts[c] = (Number(cur.counts[c] || 0) + Number(r.counts[c] || 0));
+        for (const [discord, ws] of discToWallets.entries()) {
+          const counts = {};
+          CATEGORIES.forEach(c => (counts[c] = 0));
+          let total = 0;
+
+          for (const w of ws) {
+            const r = walletResults.get(w);
+            if (!r) continue;
+            total += Number(r.total || 0);
+            for (const c of Object.keys(r.counts || {})) {
+              counts[c] = (Number(counts[c] || 0) + Number(r.counts[c] || 0));
+            }
           }
-          map.set(key, cur);
+
+          grouped.push({
+            discord,
+            counts,
+            total,
+          });
         }
-        grouped = [...map.values()].map(x => ({
-          discord: x.discord,
-          wallet: x.wallets.join(' | '),
-          counts: x.counts,
-          total: x.total
-        }));
+      } else {
+        // one row per wallet (Discord shown, but we won't display wallet column in winners)
+        grouped = rawList.map(({ discord, wallet }) => {
+          const r = walletResults.get(wallet.toLowerCase()) || { counts: {}, total: 0 };
+          return { discord, counts: r.counts || {}, total: r.total || 0 };
+        });
       }
 
       // Evaluate: first misses without leniency; then apply leniency to categories only
@@ -293,7 +317,7 @@ export default function Admin() {
       setWinnersByGroup(groups);
 
       const totals = Object.values(groups).reduce((s, arr) => s + arr.length, 0);
-      setStatus(`Done. Processed ${grouped.length} ${groupByDiscord ? 'participants' : 'wallets'}. Winners: ${totals} (0-miss: ${groups[0].length}, 1-miss: ${groups[1].length}, 2-miss: ${groups[2].length}, 3-miss: ${groups[3].length}). • ${grouped.length} / ${rows.length}`);
+      setStatus(`Done. Processed ${grouped.length} ${groupByDiscord ? 'participants' : 'rows'} (unique wallets: ${uniqueWallets.length}). Winners: ${totals} (0-miss: ${groups[0].length}, 1-miss: ${groups[1].length}, 2-miss: ${groups[2].length}, 3-miss: ${groups[3].length}).`);
     } catch (e) {
       console.error(e);
       alert(e.message || String(e));
@@ -304,7 +328,7 @@ export default function Admin() {
   function downloadCsv(rows) {
     if (!rows.length) return;
     const header = [
-      'discord', 'wallets', 'total',
+      'discord', 'total_outgoing',
       ...CATEGORIES,
       'leniency_used',
       'pre_missed_parts', 'pre_missed_list',
@@ -314,7 +338,6 @@ export default function Admin() {
     for (const r of rows) {
       const arr = [
         `"${String(r.discord || '').replace(/"/g, '""')}"`,
-        `"${String(r.wallet || '').replace(/"/g, '""')}"`,
         r.total
       ];
       for (const c of CATEGORIES) arr.push(r.counts?.[c] || 0);
@@ -422,7 +445,7 @@ export default function Admin() {
               )}
 
               <div className="min-w-[180px]">
-                <label className="text-sm text-slate-300">Min total external tx</label>
+                <label className="text-sm text-slate-300">Min total external tx (outgoing only)</label>
                 <input
                   type="number"
                   min="0"
@@ -448,11 +471,11 @@ export default function Admin() {
                 <label className="text-sm text-slate-300">Concurrency</label>
                 <input
                   type="number"
-                  min="1" max="6"
+                  min="1" max="10"
                   value={concurrency}
                   onChange={e=>setConcurrency(Number(e.target.value))}
                   className="mt-1 w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 min-h-[44px]"
-                  title="How many wallets to check in parallel (2–4 recommended)"
+                  title="How many wallets to check in parallel (higher = faster, but be gentle)"
                 />
               </div>
             </div>
@@ -542,8 +565,7 @@ export default function Admin() {
                 <thead className="text-slate-400">
                   <tr className="border-b border-slate-800">
                     <th className="px-3 py-2 text-left">Discord</th>
-                    <th className="px-3 py-2 text-left">Wallets</th>
-                    <th className="px-3 py-2 text-left">Total</th>
+                    <th className="px-3 py-2 text-left">Total (outgoing)</th>
                     {CATEGORIES.map(c => (
                       <th key={c} className="px-3 py-2 text-left">{c.replace('_',' ')}</th>
                     ))}
@@ -555,7 +577,6 @@ export default function Admin() {
                   {rowsToShow.map((r, i) => (
                     <tr key={i} className="border-b border-slate-800">
                       <td className="px-3 py-2">{r.discord}</td>
-                      <td className="px-3 py-2 font-mono text-xs">{r.wallet}</td>
                       <td className="px-3 py-2">{r.total}</td>
                       {CATEGORIES.map(c => (
                         <td key={c} className="px-3 py-2">{r.counts?.[c] || 0}</td>
@@ -571,7 +592,7 @@ export default function Admin() {
         </section>
 
         <footer className="text-slate-400 text-sm mt-8 pb-safe">
-          Notes: cc includes CCO (merged). “Total external tx” is counted as an extra part if its threshold is set; leniency only covers category shortfalls.
+          Notes: totals and category counts use ONLY outgoing external native tx (matches main page). Wallets are fetched once (dedup) for speed; winners table hides wallets per your request.
         </footer>
       </main>
     </div>
