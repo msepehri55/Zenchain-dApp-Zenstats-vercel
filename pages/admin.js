@@ -79,7 +79,6 @@ function canonicalizeCategory(c) {
 }
 
 // Count per category from activity (OUTGOING external native only, exclude fails)
-// This matches the main site's KPIs logic coming from buildStats.
 function computeCounts(activity) {
   const extOut = (Array.isArray(activity) ? activity : [])
     .filter(r => r.kind === 'native' && r.direction === 'out' && r.category !== 'fail');
@@ -87,35 +86,28 @@ function computeCounts(activity) {
   CATEGORIES.forEach(c => (counts[c] = 0));
   for (const r of extOut) {
     const c0 = canonicalizeCategory(r.category);
-    if (!c0) continue; // ignore ci/null
+    if (!c0) continue;
     if (counts[c0] == null) counts[c0] = 0;
     counts[c0] += 1;
   }
-  const total = extOut.length; // total = only outgoing external native
+  const total = extOut.length;
   return { counts, total };
 }
 
 // Build raw deficits (no leniency) for categories+total
 function buildDeficits(counts, thresholds, minTotal, totalCount) {
   const parts = [];
-
-  // Category parts
   for (const cat of CATEGORIES) {
     const need = Math.max(0, Number(thresholds[cat] || 0) - Number(counts?.[cat] || 0));
     if (Number(thresholds[cat] || 0) > 0 && need > 0) {
       parts.push({ cat, need, isTotal: false, used: 0 });
     }
   }
-
-  // Total part
   const tMin = Number(minTotal || 0);
   if (tMin > 0) {
     const tNeed = Math.max(0, tMin - Number(totalCount || 0));
-    if (tNeed > 0) {
-      parts.push({ cat: 'total', need: tNeed, isTotal: true, used: 0 });
-    }
+    if (tNeed > 0) parts.push({ cat: 'total', need: tNeed, isTotal: true, used: 0 });
   }
-
   return parts;
 }
 
@@ -123,8 +115,6 @@ function buildDeficits(counts, thresholds, minTotal, totalCount) {
 function evaluateParticipant(counts, thresholds, minTotal, totalCount, leniencyN) {
   const pre = buildDeficits(counts, thresholds, minTotal, totalCount);
   const preMissedCats = pre.map(d => d.cat);
-  const preMissed = preMissedCats.length;
-
   const catDeficits = pre.filter(d => !d.isTotal).sort((a, b) => a.need - b.need);
   const totalDeficit = pre.find(d => d.isTotal);
 
@@ -145,7 +135,7 @@ function evaluateParticipant(counts, thresholds, minTotal, totalCount, leniencyN
   const missedAfter = missedCatsAfter.length;
 
   return {
-    preMissed,
+    preMissed: preMissedCats.length,
     preMissedCats,
     missedAfter,
     missedCatsAfter,
@@ -172,16 +162,16 @@ export default function Admin() {
     CATEGORIES.forEach(c => (t[c] = 0));
     return t;
   });
-  const [minTotal, setMinTotal] = useState(0); // total = OUTGOING externals only
+  const [minTotal, setMinTotal] = useState(0);
   const [leniency, setLeniency] = useState(0);
   const [groupByDiscord, setGroupByDiscord] = useState(true);
   const [showOnlyWinners, setShowOnlyWinners] = useState(true);
-  const [concurrency, setConcurrency] = useState(6); // higher default for speed
+  const [concurrency, setConcurrency] = useState(6);
 
   // Results
   const [status, setStatus] = useState('');
   const [progress, setProgress] = useState({ done: 0, total: 0 });
-  const [results, setResults] = useState([]); // annotated rows
+  const [results, setResults] = useState([]);
   const [winnersByGroup, setWinnersByGroup] = useState({ 0: [], 1: [], 2: [], 3: [] });
   const [winTab, setWinTab] = useState(0);
   const abortRef = useRef({ aborted: false });
@@ -219,7 +209,6 @@ export default function Admin() {
     }
   }
 
-  // SPEED: deduplicate wallet fetches. Each unique wallet is fetched once, then we aggregate by Discord.
   async function run() {
     try {
       if (!windowParams) { alert('Pick a valid date range'); return; }
@@ -244,19 +233,27 @@ export default function Admin() {
 
       const limit = pLimit(Math.max(1, Number(concurrency) || 6));
 
-      // Fetch each unique wallet once via /api/activity to mirror main page logic
-      const walletResults = new Map(); // wallet -> { counts, total }
+      const walletResults = new Map();
       const tasks = uniqueWallets.map((wallet) =>
         limit(async () => {
           if (abortRef.current.aborted) return null;
           const qs = `start=${windowParams.start}&end=${windowParams.end}`;
           const url = `/api/activity?address=${encodeURIComponent(wallet)}&${qs}`;
-          const r = await fetch(url);
-          const j = await r.json();
-          if (!r.ok) throw new Error(j?.error || 'activity failed');
+          const r = await fetch(url, { headers: { accept: 'application/json' } });
 
-          // Compute counts exactly as main page KPIs do (OUTGOING external native only)
-          const { counts, total } = computeCounts(j.activity || []);
+          // Safe JSON parsing (avoid "Unexpected token <" when the API returns an HTML error page)
+          const ct = (r.headers.get('content-type') || '').toLowerCase();
+          let data;
+          if (ct.includes('application/json')) {
+            data = await r.json();
+          } else {
+            const txt = await r.text();
+            if (!r.ok) throw new Error(txt || `HTTP ${r.status}`);
+            try { data = JSON.parse(txt); } catch { throw new Error(`Unexpected response from /api/activity (HTTP ${r.status})`); }
+          }
+          if (!r.ok) throw new Error(data?.error || `HTTP ${r.status}`);
+
+          const { counts, total } = computeCounts(data.activity || []);
           return { wallet, counts, total };
         }).then((res) => {
           setProgress(p => ({ done: p.done + 1, total: p.total }));
@@ -267,7 +264,6 @@ export default function Admin() {
 
       await Promise.all(tasks);
 
-      // Aggregate by Discord (sum across that Discord's wallets), or keep per wallet if grouping=off
       let grouped = [];
       if (groupByDiscord) {
         for (const [discord, ws] of discToWallets.entries()) {
@@ -284,21 +280,15 @@ export default function Admin() {
             }
           }
 
-          grouped.push({
-            discord,
-            counts,
-            total,
-          });
+          grouped.push({ discord, counts, total });
         }
       } else {
-        // one row per wallet (Discord shown; wallets column is not displayed per your request)
         grouped = rawList.map(({ discord, wallet }) => {
           const r = walletResults.get(wallet.toLowerCase()) || { counts: {}, total: 0 };
           return { discord, counts: r.counts || {}, total: r.total || 0 };
         });
       }
 
-      // Evaluate with leniency
       const groups = { 0: [], 1: [], 2: [], 3: [] };
       const annotated = grouped.map(r => {
         const ev = evaluateParticipant(r.counts, thresholds, minTotal, r.total, leniency);
@@ -527,7 +517,6 @@ export default function Admin() {
               {showOnlyWinners ? 'Winners' : 'All Participants'}
             </h2>
 
-            {/* Tabs: missed parts AFTER leniency (total counts as part; not lenient) */}
             {showOnlyWinners && (
               <div className="flex items-center gap-2 flex-wrap">
                 {[
