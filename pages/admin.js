@@ -79,7 +79,7 @@ function canonicalizeCategory(c) {
 }
 
 // Count per category from activity (OUTGOING external native only, exclude fails)
-// This matches the main site's KPIs logic.
+// This matches the main site's KPIs logic coming from buildStats.
 function computeCounts(activity) {
   const extOut = (Array.isArray(activity) ? activity : [])
     .filter(r => r.kind === 'native' && r.direction === 'out' && r.category !== 'fail');
@@ -176,7 +176,7 @@ export default function Admin() {
   const [leniency, setLeniency] = useState(0);
   const [groupByDiscord, setGroupByDiscord] = useState(true);
   const [showOnlyWinners, setShowOnlyWinners] = useState(true);
-  const [concurrency, setConcurrency] = useState(5); // a bit higher default for speed
+  const [concurrency, setConcurrency] = useState(6); // higher default for speed
 
   // Results
   const [status, setStatus] = useState('');
@@ -219,14 +219,14 @@ export default function Admin() {
     }
   }
 
-  // SPEED: de-duplicate wallet fetches. We fetch each unique wallet once, then aggregate by Discord.
+  // SPEED: deduplicate wallet fetches. Each unique wallet is fetched once, then we aggregate by Discord.
   async function run() {
     try {
       if (!windowParams) { alert('Pick a valid date range'); return; }
       const rawList = parseCsv(csvText);
       if (!rawList.length) { alert('No valid (discord, wallet) rows found in CSV'); return; }
 
-      // Build discord -> wallets map and unique wallet list (dedup speeds things up)
+      // Build discord -> wallets map and unique wallet list
       const discToWallets = new Map();
       for (const row of rawList) {
         const d = row.discord.trim();
@@ -242,9 +242,9 @@ export default function Admin() {
       setWinnersByGroup({ 0: [], 1: [], 2: [], 3: [] });
       abortRef.current.aborted = false;
 
-      const limit = pLimit(Math.max(1, Number(concurrency) || 4));
+      const limit = pLimit(Math.max(1, Number(concurrency) || 6));
 
-      // Fetch each unique wallet once
+      // Fetch each unique wallet once via /api/activity to mirror main page logic
       const walletResults = new Map(); // wallet -> { counts, total }
       const tasks = uniqueWallets.map((wallet) =>
         limit(async () => {
@@ -255,6 +255,7 @@ export default function Admin() {
           const j = await r.json();
           if (!r.ok) throw new Error(j?.error || 'activity failed');
 
+          // Compute counts exactly as main page KPIs do (OUTGOING external native only)
           const { counts, total } = computeCounts(j.activity || []);
           return { wallet, counts, total };
         }).then((res) => {
@@ -290,14 +291,14 @@ export default function Admin() {
           });
         }
       } else {
-        // one row per wallet (Discord shown, but we won't display wallet column in winners)
+        // one row per wallet (Discord shown; wallets column is not displayed per your request)
         grouped = rawList.map(({ discord, wallet }) => {
           const r = walletResults.get(wallet.toLowerCase()) || { counts: {}, total: 0 };
           return { discord, counts: r.counts || {}, total: r.total || 0 };
         });
       }
 
-      // Evaluate: first misses without leniency; then apply leniency to categories only
+      // Evaluate with leniency
       const groups = { 0: [], 1: [], 2: [], 3: [] };
       const annotated = grouped.map(r => {
         const ev = evaluateParticipant(r.counts, thresholds, minTotal, r.total, leniency);
@@ -471,11 +472,11 @@ export default function Admin() {
                 <label className="text-sm text-slate-300">Concurrency</label>
                 <input
                   type="number"
-                  min="1" max="10"
+                  min="1" max="12"
                   value={concurrency}
                   onChange={e=>setConcurrency(Number(e.target.value))}
                   className="mt-1 w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 min-h-[44px]"
-                  title="How many wallets to check in parallel (higher = faster, but be gentle)"
+                  title="How many wallets to check in parallel (higher = faster; 5–8 recommended)"
                 />
               </div>
             </div>
@@ -592,7 +593,7 @@ export default function Admin() {
         </section>
 
         <footer className="text-slate-400 text-sm mt-8 pb-safe">
-          Notes: totals and category counts use ONLY outgoing external native tx (matches main page). Wallets are fetched once (dedup) for speed; winners table hides wallets per your request.
+          Notes: totals and category counts use ONLY outgoing external native tx (matches main page). Wallets are fetched once (dedup) for speed; winners table shows only Discord per your request.
         </footer>
       </main>
     </div>
